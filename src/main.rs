@@ -1469,7 +1469,7 @@ fn render_tui(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(12),
-                    Constraint::Length(2),
+                    Constraint::Length(4),
                 ])
                 .split(root);
 
@@ -1642,24 +1642,16 @@ fn render_tui(
                 frame.render_widget(preview_b, source_cols[1]);
             }
 
-            let footer = Paragraph::new(Line::from(vec![
-                Span::raw("↑/↓ j/k move  "),
-                Span::raw("PgUp/PgDn jump  "),
-                Span::raw("Home/End  "),
-                Span::raw("h/f filter  "),
-                Span::raw("s toggle suspicious  "),
-                Span::raw("p flagged-only view  "),
-                Span::raw("v toggle deleted view  "),
-                Span::raw("d/Del hide pair  "),
-                Span::raw("A/B hide all for student A/B  "),
-                Span::raw("u undo hide  "),
-                Span::raw("r restore selected (deleted view)  "),
-                Span::raw("? help  "),
-                Span::raw("Live preview on right  "),
-                Span::raw("Enter full compare  "),
-                Span::styled("q/Esc quit", Style::default().add_modifier(Modifier::BOLD)),
-            ]))
-            .block(Block::default().borders(Borders::ALL).title("Controls"));
+            let footer = Paragraph::new(vec![
+                Line::from(
+                    "Move: ↑/↓ j/k | Jump: PgUp/PgDn Home/End | View: h/f high, p flagged, v deleted",
+                ),
+                Line::from(
+                    "Actions: s suspicious, d/Delete hide, A/B hide by student, u undo, r restore (deleted), Enter compare, ? help, q quit",
+                ),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("Controls"))
+            .wrap(Wrap { trim: false });
             frame.render_widget(footer, chunks[2]);
         }
         TuiScreen::Compare { scroll } => {
@@ -1668,7 +1660,7 @@ fn render_tui(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(10),
-                    Constraint::Length(2),
+                    Constraint::Length(4),
                 ])
                 .split(root);
 
@@ -1728,18 +1720,14 @@ fn render_tui(
                 frame.render_widget(panel_b, columns[1]);
             }
 
-            let footer = Paragraph::new(Line::from(vec![
-                Span::raw("↑/↓ j/k scroll  "),
-                Span::raw("PgUp/PgDn fast scroll  "),
-                Span::raw("Home top  "),
-                Span::raw("s suspicious toggle  "),
-                Span::raw("d/Del hide + back  "),
-                Span::raw("u undo hide  "),
-                Span::raw("? help  "),
-                Span::raw("Esc/Backspace back  "),
-                Span::styled("q quit", Style::default().add_modifier(Modifier::BOLD)),
-            ]))
-            .block(Block::default().borders(Borders::ALL).title("Controls"));
+            let footer = Paragraph::new(vec![
+                Line::from(
+                    "Scroll: ↑/↓ j/k | Fast: PgUp/PgDn | Top: Home/g | Actions: s suspicious, d/Delete hide+back, u undo",
+                ),
+                Line::from("Navigation: Esc/Backspace back to list | ? help | q quit"),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("Controls"))
+            .wrap(Wrap { trim: false });
             frame.render_widget(footer, chunks[2]);
         }
         TuiScreen::Help => {
@@ -1748,7 +1736,7 @@ fn render_tui(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(12),
-                    Constraint::Length(2),
+                    Constraint::Length(4),
                 ])
                 .split(root);
 
@@ -1803,7 +1791,8 @@ fn render_tui(
                 ),
                 Span::raw(" to your report path"),
             ]))
-            .block(Block::default().borders(Borders::ALL).title("Notes"));
+            .block(Block::default().borders(Borders::ALL).title("Notes"))
+            .wrap(Wrap { trim: false });
             frame.render_widget(footer, chunks[2]);
         }
     }
