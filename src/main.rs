@@ -139,6 +139,8 @@ struct Report {
     pair_sources: HashMap<String, String>,
     #[serde(default)]
     deleted_pair_keys: Vec<String>,
+    #[serde(default)]
+    flagged_pair_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +156,12 @@ struct QuerySpec {
     question: String,
     cell_id: String,
     language: Language,
+}
+
+#[derive(Debug)]
+struct TuiEdits {
+    deleted_pair_keys: HashSet<String>,
+    flagged_pair_keys: HashSet<String>,
 }
 
 fn default_threshold() -> f64 {
@@ -258,6 +266,7 @@ fn run() -> Result<(), String> {
             all_pairs_sorted: all_pairs,
             pair_sources: source_by_notebook,
             deleted_pair_keys: Vec::new(),
+            flagged_pair_keys: Vec::new(),
         }
     };
 
@@ -276,15 +285,19 @@ fn run() -> Result<(), String> {
         };
 
     let mut deleted_pair_keys: HashSet<String> = report.deleted_pair_keys.iter().cloned().collect();
+    let mut flagged_pair_keys: HashSet<String> = report.flagged_pair_keys.iter().cloned().collect();
     if cli.tui {
-        deleted_pair_keys = run_tui(
+        let edits = run_tui(
             &report.all_pairs_sorted,
             &report.pair_sources,
             effective_threshold,
             effective_max_results,
             cli.table_only_high,
             &deleted_pair_keys,
+            &flagged_pair_keys,
         )?;
+        deleted_pair_keys = edits.deleted_pair_keys;
+        flagged_pair_keys = edits.flagged_pair_keys;
     }
 
     let active_pairs = apply_deleted_pairs(&report.all_pairs_sorted, &deleted_pair_keys);
@@ -304,6 +317,8 @@ fn run() -> Result<(), String> {
     }
     report.deleted_pair_keys = deleted_pair_keys.into_iter().collect();
     report.deleted_pair_keys.sort();
+    report.flagged_pair_keys = flagged_pair_keys.into_iter().collect();
+    report.flagged_pair_keys.sort();
     let deleted_pair_set: HashSet<String> = report.deleted_pair_keys.iter().cloned().collect();
     report.pair_count = active_pairs.len();
     report.high_similarity_pairs = report
@@ -1052,7 +1067,8 @@ fn run_tui(
     max_results: usize,
     start_high_only: bool,
     initial_hidden_pair_keys: &HashSet<String>,
-) -> Result<HashSet<String>, String> {
+    initial_flagged_pair_keys: &HashSet<String>,
+) -> Result<TuiEdits, String> {
     enable_raw_mode().map_err(|e| format!("failed to enable raw mode: {e}"))?;
     execute!(stdout(), EnterAlternateScreen, Hide)
         .map_err(|e| format!("failed to switch to alternate screen: {e}"))?;
@@ -1068,6 +1084,7 @@ fn run_tui(
         max_results,
         start_high_only,
         initial_hidden_pair_keys,
+        initial_flagged_pair_keys,
     );
 
     disable_raw_mode().map_err(|e| format!("failed to disable raw mode: {e}"))?;
@@ -1088,13 +1105,16 @@ fn run_tui_loop(
     max_results: usize,
     start_high_only: bool,
     initial_hidden_pair_keys: &HashSet<String>,
-) -> Result<HashSet<String>, String> {
+    initial_flagged_pair_keys: &HashSet<String>,
+) -> Result<TuiEdits, String> {
     let mut selected = 0usize;
     let mut high_only = start_high_only;
     let mut show_deleted = false;
+    let mut show_flagged_only = false;
     let mut screen = TuiScreen::List;
     let mut list_state = ListState::default();
     let mut hidden_pair_keys: HashSet<String> = initial_hidden_pair_keys.clone();
+    let mut flagged_pair_keys: HashSet<String> = initial_flagged_pair_keys.clone();
     let mut hidden_history: Vec<Vec<String>> = Vec::new();
 
     loop {
@@ -1103,7 +1123,9 @@ fn run_tui_loop(
             threshold,
             max_results,
             high_only,
+            show_flagged_only,
             &hidden_pair_keys,
+            &flagged_pair_keys,
         );
         let deleted_rows = tui_deleted_rows(all_pairs, max_results, &hidden_pair_keys);
         let rows = if show_deleted {
@@ -1111,6 +1133,7 @@ fn run_tui_loop(
         } else {
             &active_rows
         };
+        let flagged_submission_list = flagged_submissions(all_pairs, &flagged_pair_keys);
         if rows.is_empty() {
             selected = 0;
         } else if selected >= rows.len() {
@@ -1130,7 +1153,11 @@ fn run_tui_loop(
                     max_results,
                     high_only,
                     show_deleted,
+                    show_flagged_only,
                     deleted_rows.len(),
+                    flagged_pair_keys.len(),
+                    &flagged_submission_list,
+                    &flagged_pair_keys,
                     screen,
                 )
             })
@@ -1176,6 +1203,11 @@ fn run_tui_loop(
                     high_only = !high_only;
                     selected = 0;
                 }
+                KeyCode::Char('p') => {
+                    show_flagged_only = !show_flagged_only;
+                    show_deleted = false;
+                    selected = 0;
+                }
                 KeyCode::Char('v') => {
                     show_deleted = !show_deleted;
                     selected = 0;
@@ -1186,6 +1218,14 @@ fn run_tui_loop(
                 KeyCode::Enter => {
                     if !rows.is_empty() {
                         screen = TuiScreen::Compare { scroll: 0 };
+                    }
+                }
+                KeyCode::Char('s') => {
+                    if !rows.is_empty() && !show_deleted {
+                        let key = pair_key(rows[selected]);
+                        if !flagged_pair_keys.insert(key.clone()) {
+                            flagged_pair_keys.remove(&key);
+                        }
                     }
                 }
                 KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
@@ -1263,6 +1303,14 @@ fn run_tui_loop(
                 KeyCode::Home | KeyCode::Char('g') => {
                     screen = TuiScreen::Compare { scroll: 0 };
                 }
+                KeyCode::Char('s') => {
+                    if !rows.is_empty() {
+                        let key = pair_key(rows[selected]);
+                        if !flagged_pair_keys.insert(key.clone()) {
+                            flagged_pair_keys.remove(&key);
+                        }
+                    }
+                }
                 KeyCode::Char('d') | KeyCode::Delete => {
                     if !rows.is_empty() {
                         let key = pair_key(rows[selected]);
@@ -1276,7 +1324,10 @@ fn run_tui_loop(
             },
         }
     }
-    Ok(hidden_pair_keys)
+    Ok(TuiEdits {
+        deleted_pair_keys: hidden_pair_keys,
+        flagged_pair_keys,
+    })
 }
 
 fn tui_rows<'a>(
@@ -1284,11 +1335,14 @@ fn tui_rows<'a>(
     threshold: f64,
     max_results: usize,
     high_only: bool,
+    flagged_only: bool,
     hidden_pair_keys: &HashSet<String>,
+    flagged_pair_keys: &HashSet<String>,
 ) -> Vec<&'a PairScore> {
     let filtered = all_pairs
         .iter()
-        .filter(|pair| !hidden_pair_keys.contains(&pair_key(pair)));
+        .filter(|pair| !hidden_pair_keys.contains(&pair_key(pair)))
+        .filter(|pair| !flagged_only || flagged_pair_keys.contains(&pair_key(pair)));
     if high_only {
         filtered
             .filter(|pair| pair.score >= threshold)
@@ -1324,6 +1378,22 @@ fn apply_deleted_pairs(
         .filter(|pair| !deleted_pair_keys.contains(&pair_key(pair)))
         .cloned()
         .collect()
+}
+
+fn flagged_submissions(
+    all_pairs: &[PairScore],
+    flagged_pair_keys: &HashSet<String>,
+) -> Vec<String> {
+    let mut set = HashSet::new();
+    for pair in all_pairs {
+        if flagged_pair_keys.contains(&pair_key(pair)) {
+            set.insert(pair.student_a.clone());
+            set.insert(pair.student_b.clone());
+        }
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort();
+    out
 }
 
 fn hide_pairs_for_student(
@@ -1367,7 +1437,11 @@ fn render_tui(
     max_results: usize,
     high_only: bool,
     show_deleted: bool,
+    show_flagged_only: bool,
     deleted_count: usize,
+    flagged_count: usize,
+    flagged_submission_list: &[String],
+    flagged_pair_keys: &HashSet<String>,
     screen: TuiScreen,
 ) {
     let root = frame.area();
@@ -1389,6 +1463,8 @@ fn render_tui(
             };
             let view_mode = if show_deleted {
                 "Viewing deleted pairs"
+            } else if show_flagged_only {
+                "Viewing flagged pairs only"
             } else {
                 "Viewing active pairs"
             };
@@ -1400,7 +1476,7 @@ fn render_tui(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
-                    "  |  threshold={threshold:.2}  max={max_results}  |  {mode}  |  {view_mode}  |  deleted={deleted_count}"
+                    "  |  threshold={threshold:.2}  max={max_results}  |  {mode}  |  {view_mode}  |  deleted={deleted_count} flagged={flagged_count}"
                 )),
             ]))
             .block(Block::default().borders(Borders::ALL).title("Overview"));
@@ -1415,9 +1491,14 @@ fn render_tui(
                 .iter()
                 .map(|pair| {
                     let flag = if pair.score >= threshold { "HIGH" } else { "" };
+                    let suspicious = if flagged_pair_keys.contains(&pair_key(pair)) {
+                        "SUS"
+                    } else {
+                        ""
+                    };
                     ListItem::new(Line::from(vec![
                         Span::raw(format!(
-                            "{:<16} {:<16} {:>7.4} ",
+                            "{:<14} {:<14} {:>7.4} ",
                             shorten(&pair.student_a, 16),
                             shorten(&pair.student_b, 16),
                             pair.score
@@ -1428,6 +1509,17 @@ fn render_tui(
                                 Style::default()
                             } else {
                                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                            },
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            suspicious,
+                            if suspicious.is_empty() {
+                                Style::default()
+                            } else {
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD)
                             },
                         ),
                     ]))
@@ -1483,6 +1575,22 @@ fn render_tui(
                     )),
                     Line::from(format!("A: {}", pair.notebook_a)),
                     Line::from(format!("B: {}", pair.notebook_b)),
+                    Line::from(format!(
+                        "Suspicious: {}",
+                        if flagged_pair_keys.contains(&pair_key(pair)) {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    )),
+                    Line::from(format!(
+                        "Flagged submissions: {}",
+                        if flagged_submission_list.is_empty() {
+                            "<none>".to_owned()
+                        } else {
+                            shorten(&flagged_submission_list.join(", "), 120)
+                        }
+                    )),
                 ])
                 .block(
                     Block::default()
@@ -1522,6 +1630,8 @@ fn render_tui(
                 Span::raw("PgUp/PgDn jump  "),
                 Span::raw("Home/End  "),
                 Span::raw("h/f filter  "),
+                Span::raw("s toggle suspicious  "),
+                Span::raw("p flagged-only view  "),
                 Span::raw("v toggle deleted view  "),
                 Span::raw("d/Del hide pair  "),
                 Span::raw("A/B hide all for student A/B  "),
@@ -1604,6 +1714,7 @@ fn render_tui(
                 Span::raw("↑/↓ j/k scroll  "),
                 Span::raw("PgUp/PgDn fast scroll  "),
                 Span::raw("Home top  "),
+                Span::raw("s suspicious toggle  "),
                 Span::raw("d/Del hide + back  "),
                 Span::raw("u undo hide  "),
                 Span::raw("Esc/Backspace back  "),
@@ -1666,6 +1777,8 @@ fn print_table(all_pairs: &[PairScore], threshold: f64, max_results: usize, tabl
         threshold,
         max_results,
         table_only_high,
+        false,
+        &HashSet::new(),
         &HashSet::new(),
     );
 
@@ -1805,8 +1918,32 @@ def f():
                 notebook_b: "c.ipynb".to_owned(),
             },
         ];
-        assert_eq!(tui_rows(&pairs, 0.85, 10, true, &HashSet::new()).len(), 1);
-        assert_eq!(tui_rows(&pairs, 0.85, 1, false, &HashSet::new()).len(), 1);
+        assert_eq!(
+            tui_rows(
+                &pairs,
+                0.85,
+                10,
+                true,
+                false,
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            tui_rows(
+                &pairs,
+                0.85,
+                1,
+                false,
+                false,
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
@@ -1907,5 +2044,33 @@ def f():
         let added = hide_pairs_for_student(&pairs, "alice", &mut hidden);
         assert_eq!(added.len(), 2);
         assert_eq!(hidden.len(), 2);
+    }
+
+    #[test]
+    fn flagged_submissions_collects_unique_students() {
+        let pairs = vec![
+            PairScore {
+                student_a: "alice".to_owned(),
+                student_b: "bob".to_owned(),
+                score: 0.9,
+                notebook_a: "a.ipynb".to_owned(),
+                notebook_b: "b.ipynb".to_owned(),
+            },
+            PairScore {
+                student_a: "bob".to_owned(),
+                student_b: "carla".to_owned(),
+                score: 0.9,
+                notebook_a: "b.ipynb".to_owned(),
+                notebook_b: "c.ipynb".to_owned(),
+            },
+        ];
+        let mut flagged = HashSet::new();
+        flagged.insert(pair_key(&pairs[0]));
+        flagged.insert(pair_key(&pairs[1]));
+        let subs = flagged_submissions(&pairs, &flagged);
+        assert_eq!(
+            subs,
+            vec!["alice".to_owned(), "bob".to_owned(), "carla".to_owned()]
+        );
     }
 }
