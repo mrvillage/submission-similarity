@@ -1095,7 +1095,7 @@ fn run_tui_loop(
     let mut screen = TuiScreen::List;
     let mut list_state = ListState::default();
     let mut hidden_pair_keys: HashSet<String> = initial_hidden_pair_keys.clone();
-    let mut hidden_history: Vec<String> = Vec::new();
+    let mut hidden_history: Vec<Vec<String>> = Vec::new();
 
     loop {
         let active_rows = tui_rows(
@@ -1192,17 +1192,46 @@ fn run_tui_loop(
                     if !rows.is_empty() && !show_deleted {
                         let key = pair_key(rows[selected]);
                         if hidden_pair_keys.insert(key.clone()) {
-                            hidden_history.push(key);
+                            hidden_history.push(vec![key]);
                         }
                         let max_idx = rows.len().saturating_sub(2);
                         selected = selected.min(max_idx);
+                    }
+                }
+                KeyCode::Char('A') => {
+                    if !rows.is_empty() && !show_deleted {
+                        let added = hide_pairs_for_student(
+                            all_pairs,
+                            &rows[selected].student_a,
+                            &mut hidden_pair_keys,
+                        );
+                        if !added.is_empty() {
+                            hidden_history.push(added);
+                        }
+                        selected = 0;
+                    }
+                }
+                KeyCode::Char('B') => {
+                    if !rows.is_empty() && !show_deleted {
+                        let added = hide_pairs_for_student(
+                            all_pairs,
+                            &rows[selected].student_b,
+                            &mut hidden_pair_keys,
+                        );
+                        if !added.is_empty() {
+                            hidden_history.push(added);
+                        }
+                        selected = 0;
                     }
                 }
                 KeyCode::Char('r') => {
                     if !rows.is_empty() && show_deleted {
                         let key = pair_key(rows[selected]);
                         hidden_pair_keys.remove(&key);
-                        hidden_history.retain(|k| k != &key);
+                        for batch in &mut hidden_history {
+                            batch.retain(|k| k != &key);
+                        }
+                        hidden_history.retain(|batch| !batch.is_empty());
                     }
                 }
                 _ => {}
@@ -1238,7 +1267,7 @@ fn run_tui_loop(
                     if !rows.is_empty() {
                         let key = pair_key(rows[selected]);
                         if hidden_pair_keys.insert(key.clone()) {
-                            hidden_history.push(key);
+                            hidden_history.push(vec![key]);
                         }
                         screen = TuiScreen::List;
                     }
@@ -1297,12 +1326,31 @@ fn apply_deleted_pairs(
         .collect()
 }
 
+fn hide_pairs_for_student(
+    all_pairs: &[PairScore],
+    student: &str,
+    hidden_pair_keys: &mut HashSet<String>,
+) -> Vec<String> {
+    let mut added = Vec::new();
+    for pair in all_pairs {
+        if pair.student_a == student || pair.student_b == student {
+            let key = pair_key(pair);
+            if hidden_pair_keys.insert(key.clone()) {
+                added.push(key);
+            }
+        }
+    }
+    added
+}
+
 fn undo_last_hidden(
     hidden_pair_keys: &mut HashSet<String>,
-    hidden_history: &mut Vec<String>,
+    hidden_history: &mut Vec<Vec<String>>,
 ) -> bool {
-    if let Some(last) = hidden_history.pop() {
-        hidden_pair_keys.remove(&last);
+    if let Some(last_batch) = hidden_history.pop() {
+        for key in last_batch {
+            hidden_pair_keys.remove(&key);
+        }
         true
     } else {
         false
@@ -1476,6 +1524,7 @@ fn render_tui(
                 Span::raw("h/f filter  "),
                 Span::raw("v toggle deleted view  "),
                 Span::raw("d/Del hide pair  "),
+                Span::raw("A/B hide all for student A/B  "),
                 Span::raw("u undo hide  "),
                 Span::raw("r restore selected (deleted view)  "),
                 Span::raw("Live preview on right  "),
@@ -1821,11 +1870,42 @@ def f():
     #[test]
     fn undo_last_hidden_restores_last_entry() {
         let mut hidden = HashSet::from(["a".to_owned(), "b".to_owned()]);
-        let mut history = vec!["a".to_owned(), "b".to_owned()];
+        let mut history = vec![vec!["a".to_owned()], vec!["b".to_owned()]];
         let undone = undo_last_hidden(&mut hidden, &mut history);
         assert!(undone);
         assert!(!hidden.contains("b"));
         assert!(hidden.contains("a"));
-        assert_eq!(history, vec!["a".to_owned()]);
+        assert_eq!(history, vec![vec!["a".to_owned()]]);
+    }
+
+    #[test]
+    fn hide_pairs_for_student_hides_all_matching_pairs() {
+        let pairs = vec![
+            PairScore {
+                student_a: "alice".to_owned(),
+                student_b: "bob".to_owned(),
+                score: 0.9,
+                notebook_a: "a.ipynb".to_owned(),
+                notebook_b: "b.ipynb".to_owned(),
+            },
+            PairScore {
+                student_a: "alice".to_owned(),
+                student_b: "carla".to_owned(),
+                score: 0.8,
+                notebook_a: "a.ipynb".to_owned(),
+                notebook_b: "c.ipynb".to_owned(),
+            },
+            PairScore {
+                student_a: "diego".to_owned(),
+                student_b: "erin".to_owned(),
+                score: 0.7,
+                notebook_a: "d.ipynb".to_owned(),
+                notebook_b: "e.ipynb".to_owned(),
+            },
+        ];
+        let mut hidden = HashSet::new();
+        let added = hide_pairs_for_student(&pairs, "alice", &mut hidden);
+        assert_eq!(added.len(), 2);
+        assert_eq!(hidden.len(), 2);
     }
 }
