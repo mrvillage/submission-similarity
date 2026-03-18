@@ -1,10 +1,24 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
+use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -47,6 +61,9 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     lowercase: bool,
+
+    #[arg(long, default_value_t = false)]
+    tui: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -62,6 +79,7 @@ enum Language {
 struct Submission {
     student: String,
     notebook_path: PathBuf,
+    source: String,
     normalized: String,
 }
 
@@ -86,6 +104,7 @@ struct ReportConfig {
     target_student: Option<String>,
     table_only_high: bool,
     lowercase: bool,
+    tui: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +137,15 @@ fn run() -> Result<(), String> {
             submissions.len()
         ));
     }
+    let source_by_notebook: HashMap<String, String> = submissions
+        .iter()
+        .map(|submission| {
+            (
+                submission.notebook_path.display().to_string(),
+                submission.source.clone(),
+            )
+        })
+        .collect();
 
     let all_pairs = compute_pair_scores(&submissions, cli.target_student.as_deref());
     let mut high_pairs: Vec<PairScore> = all_pairs
@@ -127,12 +155,22 @@ fn run() -> Result<(), String> {
         .collect();
     high_pairs.sort_by(sort_scores_desc);
 
-    print_table(
-        &all_pairs,
-        cli.threshold,
-        cli.max_results,
-        cli.table_only_high,
-    );
+    if cli.tui {
+        run_tui(
+            &all_pairs,
+            &source_by_notebook,
+            cli.threshold,
+            cli.max_results,
+            cli.table_only_high,
+        )?;
+    } else {
+        print_table(
+            &all_pairs,
+            cli.threshold,
+            cli.max_results,
+            cli.table_only_high,
+        );
+    }
     print_warnings(&warnings);
 
     let report = Report {
@@ -147,6 +185,7 @@ fn run() -> Result<(), String> {
             target_student: cli.target_student,
             table_only_high: cli.table_only_high,
             lowercase: cli.lowercase,
+            tui: cli.tui,
         },
         submission_count: submissions.len(),
         pair_count: all_pairs.len(),
@@ -252,6 +291,7 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
         submissions.push(Submission {
             student: student_name,
             notebook_path: notebook_path.clone(),
+            source,
             normalized,
         });
     }
@@ -709,8 +749,168 @@ fn strip_python_comments_and_docstrings(input: &str) -> String {
     out
 }
 
-fn print_table(all_pairs: &[PairScore], threshold: f64, max_results: usize, table_only_high: bool) {
-    let rows: Vec<&PairScore> = if table_only_high {
+#[derive(Clone, Copy)]
+enum TuiScreen {
+    List,
+    Compare { scroll: u16 },
+}
+
+fn run_tui(
+    all_pairs: &[PairScore],
+    source_by_notebook: &HashMap<String, String>,
+    threshold: f64,
+    max_results: usize,
+    start_high_only: bool,
+) -> Result<(), String> {
+    enable_raw_mode().map_err(|e| format!("failed to enable raw mode: {e}"))?;
+    execute!(stdout(), EnterAlternateScreen, Hide)
+        .map_err(|e| format!("failed to switch to alternate screen: {e}"))?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)
+        .map_err(|e| format!("failed to initialize terminal backend: {e}"))?;
+
+    let result = run_tui_loop(
+        &mut terminal,
+        all_pairs,
+        source_by_notebook,
+        threshold,
+        max_results,
+        start_high_only,
+    );
+
+    disable_raw_mode().map_err(|e| format!("failed to disable raw mode: {e}"))?;
+    execute!(terminal.backend_mut(), Show, LeaveAlternateScreen)
+        .map_err(|e| format!("failed to restore terminal screen: {e}"))?;
+    terminal
+        .show_cursor()
+        .map_err(|e| format!("failed to restore cursor: {e}"))?;
+
+    result
+}
+
+fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    all_pairs: &[PairScore],
+    source_by_notebook: &HashMap<String, String>,
+    threshold: f64,
+    max_results: usize,
+    start_high_only: bool,
+) -> Result<(), String> {
+    let mut selected = 0usize;
+    let mut high_only = start_high_only;
+    let mut screen = TuiScreen::List;
+    let mut list_state = ListState::default();
+
+    loop {
+        let rows = tui_rows(all_pairs, threshold, max_results, high_only);
+        if rows.is_empty() {
+            selected = 0;
+        } else if selected >= rows.len() {
+            selected = rows.len() - 1;
+        }
+
+        list_state.select((!rows.is_empty()).then_some(selected));
+        terminal
+            .draw(|frame| {
+                render_tui(
+                    frame,
+                    &rows,
+                    source_by_notebook,
+                    &list_state,
+                    selected,
+                    threshold,
+                    max_results,
+                    high_only,
+                    screen,
+                )
+            })
+            .map_err(|e| format!("failed to draw TUI frame: {e}"))?;
+
+        if !event::poll(Duration::from_millis(200))
+            .map_err(|e| format!("event poll failed: {e}"))?
+        {
+            continue;
+        }
+        let evt = event::read().map_err(|e| format!("event read failed: {e}"))?;
+        let Event::Key(key) = evt else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match screen {
+            TuiScreen::List => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max_idx = rows.len().saturating_sub(1);
+                    selected = (selected + 1).min(max_idx);
+                }
+                KeyCode::PageUp => {
+                    selected = selected.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    let max_idx = rows.len().saturating_sub(1);
+                    selected = (selected + 10).min(max_idx);
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    selected = 0;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    selected = rows.len().saturating_sub(1);
+                }
+                KeyCode::Char('h') | KeyCode::Char('f') => {
+                    high_only = !high_only;
+                    selected = 0;
+                }
+                KeyCode::Enter => {
+                    if !rows.is_empty() {
+                        screen = TuiScreen::Compare { scroll: 0 };
+                    }
+                }
+                _ => {}
+            },
+            TuiScreen::Compare { mut scroll } => match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc | KeyCode::Backspace => {
+                    screen = TuiScreen::List;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    screen = TuiScreen::Compare { scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = scroll.saturating_add(1);
+                    screen = TuiScreen::Compare { scroll };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                    screen = TuiScreen::Compare { scroll };
+                }
+                KeyCode::PageDown => {
+                    scroll = scroll.saturating_add(10);
+                    screen = TuiScreen::Compare { scroll };
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    screen = TuiScreen::Compare { scroll: 0 };
+                }
+                _ => {}
+            },
+        }
+    }
+    Ok(())
+}
+
+fn tui_rows(
+    all_pairs: &[PairScore],
+    threshold: f64,
+    max_results: usize,
+    high_only: bool,
+) -> Vec<&PairScore> {
+    if high_only {
         all_pairs
             .iter()
             .filter(|pair| pair.score >= threshold)
@@ -718,7 +918,213 @@ fn print_table(all_pairs: &[PairScore], threshold: f64, max_results: usize, tabl
             .collect()
     } else {
         all_pairs.iter().take(max_results).collect()
-    };
+    }
+}
+
+fn render_tui(
+    frame: &mut Frame<'_>,
+    rows: &[&PairScore],
+    source_by_notebook: &HashMap<String, String>,
+    list_state: &ListState,
+    selected: usize,
+    threshold: f64,
+    max_results: usize,
+    high_only: bool,
+    screen: TuiScreen,
+) {
+    let root = frame.area();
+    match screen {
+        TuiScreen::List => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(6),
+                    Constraint::Length(2),
+                ])
+                .split(root);
+
+            let mode = if high_only {
+                "High-only filter ON"
+            } else {
+                "Showing top scores"
+            };
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Submission Similarity Viewer",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "  |  threshold={threshold:.2}  max={max_results}  |  {mode}"
+                )),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title("Overview"));
+            frame.render_widget(header, chunks[0]);
+
+            let list_items: Vec<ListItem<'_>> = rows
+                .iter()
+                .map(|pair| {
+                    let flag = if pair.score >= threshold { "HIGH" } else { "" };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!(
+                            "{:<16} {:<16} {:>7.4} ",
+                            shorten(&pair.student_a, 16),
+                            shorten(&pair.student_b, 16),
+                            pair.score
+                        )),
+                        Span::styled(
+                            flag,
+                            if flag.is_empty() {
+                                Style::default()
+                            } else {
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                            },
+                        ),
+                    ]))
+                })
+                .collect();
+
+            let list = List::new(list_items)
+                .block(Block::default().borders(Borders::ALL).title("Pairs"))
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ");
+            let mut state = list_state.clone();
+            frame.render_stateful_widget(list, chunks[1], &mut state);
+
+            let details = if rows.is_empty() {
+                vec![Line::from("No pairs available for the current filter.")]
+            } else {
+                let pair = rows[selected];
+                vec![
+                    Line::from(format!(
+                        "Selected: {} ↔ {} (score {:.4})",
+                        pair.student_a, pair.student_b, pair.score
+                    )),
+                    Line::from(format!("Notebook A: {}", pair.notebook_a)),
+                    Line::from(format!("Notebook B: {}", pair.notebook_b)),
+                    Line::from("Press Enter for side-by-side source view."),
+                ]
+            };
+            let details_paragraph = Paragraph::new(details)
+                .block(Block::default().borders(Borders::ALL).title("Details"))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(details_paragraph, chunks[2]);
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::raw("↑/↓ j/k move  "),
+                Span::raw("PgUp/PgDn jump  "),
+                Span::raw("Home/End  "),
+                Span::raw("h/f filter  "),
+                Span::raw("Enter compare  "),
+                Span::styled("q/Esc quit", Style::default().add_modifier(Modifier::BOLD)),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title("Controls"));
+            frame.render_widget(footer, chunks[3]);
+        }
+        TuiScreen::Compare { scroll } => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(2),
+                ])
+                .split(root);
+
+            if rows.is_empty() {
+                let empty = Paragraph::new("No pair selected. Press Esc to go back.")
+                    .block(Block::default().borders(Borders::ALL).title("Compare"));
+                frame.render_widget(empty, chunks[1]);
+            } else {
+                let pair = rows[selected];
+                let header = Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "Side-by-Side Source View",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        "  |  {} ↔ {}  |  score {:.4}  |  scroll {}",
+                        pair.student_a, pair.student_b, pair.score, scroll
+                    )),
+                ]))
+                .block(Block::default().borders(Borders::ALL).title("Compare"));
+                frame.render_widget(header, chunks[0]);
+
+                let columns = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(chunks[1]);
+
+                let source_a = source_by_notebook
+                    .get(&pair.notebook_a)
+                    .map(String::as_str)
+                    .unwrap_or("<source unavailable>");
+                let source_b = source_by_notebook
+                    .get(&pair.notebook_b)
+                    .map(String::as_str)
+                    .unwrap_or("<source unavailable>");
+
+                let panel_a = Paragraph::new(source_a)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!("{} | {}", pair.student_a, pair.notebook_a)),
+                    )
+                    .scroll((scroll, 0))
+                    .wrap(Wrap { trim: false });
+                let panel_b = Paragraph::new(source_b)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!("{} | {}", pair.student_b, pair.notebook_b)),
+                    )
+                    .scroll((scroll, 0))
+                    .wrap(Wrap { trim: false });
+
+                frame.render_widget(panel_a, columns[0]);
+                frame.render_widget(panel_b, columns[1]);
+            }
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::raw("↑/↓ j/k scroll  "),
+                Span::raw("PgUp/PgDn fast scroll  "),
+                Span::raw("Home top  "),
+                Span::raw("Esc/Backspace back  "),
+                Span::styled("q quit", Style::default().add_modifier(Modifier::BOLD)),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title("Controls"));
+            frame.render_widget(footer, chunks[2]);
+        }
+    }
+}
+
+fn shorten(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if input.chars().count() <= max_chars {
+        return input.to_owned();
+    }
+    let mut out = String::new();
+    for ch in input.chars().take(max_chars.saturating_sub(3)) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn print_table(all_pairs: &[PairScore], threshold: f64, max_results: usize, table_only_high: bool) {
+    let rows = tui_rows(all_pairs, threshold, max_results, table_only_high);
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -836,5 +1242,33 @@ def f():
         assert_eq!(source, "print(42)\ny=3\n");
 
         fs::remove_file(&path).expect("should clean temporary notebook");
+    }
+
+    #[test]
+    fn tui_rows_respects_high_only_and_limit() {
+        let pairs = vec![
+            PairScore {
+                student_a: "a".to_owned(),
+                student_b: "b".to_owned(),
+                score: 0.95,
+                notebook_a: "a.ipynb".to_owned(),
+                notebook_b: "b.ipynb".to_owned(),
+            },
+            PairScore {
+                student_a: "a".to_owned(),
+                student_b: "c".to_owned(),
+                score: 0.5,
+                notebook_a: "a.ipynb".to_owned(),
+                notebook_b: "c.ipynb".to_owned(),
+            },
+        ];
+        assert_eq!(tui_rows(&pairs, 0.85, 10, true).len(), 1);
+        assert_eq!(tui_rows(&pairs, 0.85, 1, false).len(), 1);
+    }
+
+    #[test]
+    fn clip_shortens_long_text() {
+        let clipped = shorten("abcdefghijklmnopqrstuvwxyz", 10);
+        assert_eq!(clipped, "abcdefg...");
     }
 }
