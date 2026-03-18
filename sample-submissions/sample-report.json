@@ -7,6 +7,9 @@
     "language": "python",
     "threshold": 0.85,
     "max_results": 20,
+    "solution_dir": null,
+    "solution_notebook": null,
+    "solution_threshold": null,
     "target_student": null,
     "table_only_high": false,
     "lowercase": false,
@@ -14,6 +17,7 @@
   },
   "submission_count": 6,
   "pair_count": 15,
+  "excluded_high_pairs_due_to_solution": 0,
   "high_similarity_count": 1,
   "warnings": [],
   "high_similarity_pairs": [

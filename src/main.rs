@@ -1100,8 +1100,7 @@ fn render_tui(
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Min(10),
-                    Constraint::Length(6),
+                    Constraint::Min(12),
                     Constraint::Length(2),
                 ])
                 .split(root);
@@ -1124,6 +1123,11 @@ fn render_tui(
             ]))
             .block(Block::default().borders(Borders::ALL).title("Overview"));
             frame.render_widget(header, chunks[0]);
+
+            let body_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+                .split(chunks[1]);
 
             let list_items: Vec<ListItem<'_>> = rows
                 .iter()
@@ -1149,7 +1153,7 @@ fn render_tui(
                 .collect();
 
             let list = List::new(list_items)
-                .block(Block::default().borders(Borders::ALL).title("Pairs"))
+                .block(Block::default().borders(Borders::ALL).title("Pairs (left)"))
                 .highlight_style(
                     Style::default()
                         .bg(Color::Blue)
@@ -1158,37 +1162,82 @@ fn render_tui(
                 )
                 .highlight_symbol(">> ");
             let mut state = list_state.clone();
-            frame.render_stateful_widget(list, chunks[1], &mut state);
+            frame.render_stateful_widget(list, body_chunks[0], &mut state);
 
-            let details = if rows.is_empty() {
-                vec![Line::from("No pairs available for the current filter.")]
+            let preview_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(5), Constraint::Min(8)])
+                .split(body_chunks[1]);
+            if rows.is_empty() {
+                let empty = Paragraph::new("No pairs available for the current filter.").block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Live Preview (right)"),
+                );
+                frame.render_widget(empty, body_chunks[1]);
             } else {
                 let pair = rows[selected];
-                vec![
+                let source_a = source_by_notebook
+                    .get(&pair.notebook_a)
+                    .map(String::as_str)
+                    .unwrap_or("<source unavailable>");
+                let source_b = source_by_notebook
+                    .get(&pair.notebook_b)
+                    .map(String::as_str)
+                    .unwrap_or("<source unavailable>");
+
+                let meta = Paragraph::new(vec![
                     Line::from(format!(
                         "Selected: {} ↔ {} (score {:.4})",
                         pair.student_a, pair.student_b, pair.score
                     )),
-                    Line::from(format!("Notebook A: {}", pair.notebook_a)),
-                    Line::from(format!("Notebook B: {}", pair.notebook_b)),
-                    Line::from("Press Enter for side-by-side source view."),
-                ]
-            };
-            let details_paragraph = Paragraph::new(details)
-                .block(Block::default().borders(Borders::ALL).title("Details"))
+                    Line::from(format!("A: {}", pair.notebook_a)),
+                    Line::from(format!("B: {}", pair.notebook_b)),
+                ])
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Live Preview (right)"),
+                )
                 .wrap(Wrap { trim: false });
-            frame.render_widget(details_paragraph, chunks[2]);
+                frame.render_widget(meta, preview_chunks[0]);
+
+                let source_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(preview_chunks[1]);
+                let max_lines = source_cols[0].height.saturating_sub(2) as usize;
+                let max_cols = source_cols[0].width.saturating_sub(2) as usize;
+
+                let preview_a = Paragraph::new(preview_source(source_a, max_lines, max_cols))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!("{} source", pair.student_a)),
+                    )
+                    .wrap(Wrap { trim: false });
+                let preview_b = Paragraph::new(preview_source(source_b, max_lines, max_cols))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!("{} source", pair.student_b)),
+                    )
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(preview_a, source_cols[0]);
+                frame.render_widget(preview_b, source_cols[1]);
+            }
 
             let footer = Paragraph::new(Line::from(vec![
                 Span::raw("↑/↓ j/k move  "),
                 Span::raw("PgUp/PgDn jump  "),
                 Span::raw("Home/End  "),
                 Span::raw("h/f filter  "),
-                Span::raw("Enter compare  "),
+                Span::raw("Live preview on right  "),
+                Span::raw("Enter full compare  "),
                 Span::styled("q/Esc quit", Style::default().add_modifier(Modifier::BOLD)),
             ]))
             .block(Block::default().borders(Borders::ALL).title("Controls"));
-            frame.render_widget(footer, chunks[3]);
+            frame.render_widget(footer, chunks[2]);
         }
         TuiScreen::Compare { scroll } => {
             let chunks = Layout::default()
@@ -1282,6 +1331,36 @@ fn shorten(input: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+fn preview_source(source: &str, max_lines: usize, max_cols: usize) -> String {
+    if max_lines == 0 || max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut count = 0usize;
+    for (idx, line) in source.lines().enumerate() {
+        if count >= max_lines {
+            break;
+        }
+        let line_label = format!("{:>3}: ", idx + 1);
+        let available = max_cols.saturating_sub(line_label.chars().count());
+        out.push_str(&line_label);
+        out.push_str(&shorten(line, available.max(1)));
+        out.push('\n');
+        count += 1;
+    }
+    let total_lines = source.lines().count();
+    if total_lines > count && count > 0 {
+        let marker = "...";
+        let last_line_width = max_cols.min(marker.len());
+        out.push_str(&marker[..last_line_width]);
+    }
+    if out.is_empty() {
+        "<empty source>".to_owned()
+    } else {
+        out
+    }
 }
 
 fn print_table(all_pairs: &[PairScore], threshold: f64, max_results: usize, table_only_high: bool) {
@@ -1431,6 +1510,16 @@ def f():
     fn clip_shortens_long_text() {
         let clipped = shorten("abcdefghijklmnopqrstuvwxyz", 10);
         assert_eq!(clipped, "abcdefg...");
+    }
+
+    #[test]
+    fn preview_source_limits_lines_and_columns() {
+        let src = "first very very long line\nsecond line\nthird line";
+        let preview = preview_source(src, 2, 12);
+        assert!(preview.contains("1:"));
+        assert!(preview.contains("2:"));
+        assert!(preview.contains("..."));
+        assert!(!preview.contains("third line"));
     }
 
     #[test]
