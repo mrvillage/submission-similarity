@@ -1058,6 +1058,7 @@ fn strip_python_comments_and_docstrings(input: &str) -> String {
 enum TuiScreen {
     List,
     Compare { scroll: u16 },
+    Help,
 }
 
 fn run_tui(
@@ -1112,6 +1113,7 @@ fn run_tui_loop(
     let mut show_deleted = false;
     let mut show_flagged_only = false;
     let mut screen = TuiScreen::List;
+    let mut help_return_screen = TuiScreen::List;
     let mut list_state = ListState::default();
     let mut hidden_pair_keys: HashSet<String> = initial_hidden_pair_keys.clone();
     let mut flagged_pair_keys: HashSet<String> = initial_flagged_pair_keys.clone();
@@ -1179,6 +1181,10 @@ fn run_tui_loop(
         match screen {
             TuiScreen::List => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('?') | KeyCode::F(1) => {
+                    help_return_screen = screen;
+                    screen = TuiScreen::Help;
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     selected = selected.saturating_sub(1);
                 }
@@ -1278,6 +1284,10 @@ fn run_tui_loop(
             },
             TuiScreen::Compare { mut scroll } => match key.code {
                 KeyCode::Char('q') => break,
+                KeyCode::Char('?') | KeyCode::F(1) => {
+                    help_return_screen = screen;
+                    screen = TuiScreen::Help;
+                }
                 KeyCode::Char('u') => {
                     undo_last_hidden(&mut hidden_pair_keys, &mut hidden_history);
                 }
@@ -1319,6 +1329,13 @@ fn run_tui_loop(
                         }
                         screen = TuiScreen::List;
                     }
+                }
+                _ => {}
+            },
+            TuiScreen::Help => match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => {
+                    screen = help_return_screen;
                 }
                 _ => {}
             },
@@ -1637,6 +1654,7 @@ fn render_tui(
                 Span::raw("A/B hide all for student A/B  "),
                 Span::raw("u undo hide  "),
                 Span::raw("r restore selected (deleted view)  "),
+                Span::raw("? help  "),
                 Span::raw("Live preview on right  "),
                 Span::raw("Enter full compare  "),
                 Span::styled("q/Esc quit", Style::default().add_modifier(Modifier::BOLD)),
@@ -1717,10 +1735,75 @@ fn render_tui(
                 Span::raw("s suspicious toggle  "),
                 Span::raw("d/Del hide + back  "),
                 Span::raw("u undo hide  "),
+                Span::raw("? help  "),
                 Span::raw("Esc/Backspace back  "),
                 Span::styled("q quit", Style::default().add_modifier(Modifier::BOLD)),
             ]))
             .block(Block::default().borders(Borders::ALL).title("Controls"));
+            frame.render_widget(footer, chunks[2]);
+        }
+        TuiScreen::Help => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(12),
+                    Constraint::Length(2),
+                ])
+                .split(root);
+
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "TUI Help / Controls",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  |  press Esc, ? or F1 to return"),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title("Help"));
+            frame.render_widget(header, chunks[0]);
+
+            let help_text = Paragraph::new(vec![
+                Line::from("Global"),
+                Line::from("  q: quit app"),
+                Line::from("  ?: open/close this help"),
+                Line::from(""),
+                Line::from("List View"),
+                Line::from("  ↑/↓ or j/k: move selection"),
+                Line::from("  PgUp/PgDn: jump list"),
+                Line::from("  Home/End: jump top/bottom"),
+                Line::from("  Enter: open full side-by-side compare"),
+                Line::from("  s: toggle suspicious flag on selected pair"),
+                Line::from("  p: toggle flagged-only view"),
+                Line::from("  v: toggle deleted-pairs view"),
+                Line::from("  d/Delete/Backspace: hide selected pair"),
+                Line::from("  A: hide all pairs involving selected student A"),
+                Line::from("  B: hide all pairs involving selected student B"),
+                Line::from("  u: undo last hide action"),
+                Line::from("  r: restore selected pair (deleted view only)"),
+                Line::from(""),
+                Line::from("Compare View"),
+                Line::from("  ↑/↓ or j/k: scroll sources"),
+                Line::from("  PgUp/PgDn: fast scroll"),
+                Line::from("  Home/g: jump top"),
+                Line::from("  s: toggle suspicious flag"),
+                Line::from("  d/Delete: hide pair and return"),
+                Line::from("  Esc/Backspace: return to list"),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("Reference"))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(help_text, chunks[1]);
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::raw("Tip: save your decisions by setting "),
+                Span::styled(
+                    "--json-output",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" to your report path"),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title("Notes"));
             frame.render_widget(footer, chunks[2]);
         }
     }
