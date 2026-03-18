@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Parser, Debug, Clone)]
@@ -29,20 +29,23 @@ use serde_json::Value;
     about = "Finds high-similarity notebook submissions by nbgrader cell ID"
 )]
 struct Cli {
-    #[arg(long)]
-    root_dir: PathBuf,
+    #[arg(long, required_unless_present = "load_report")]
+    root_dir: Option<PathBuf>,
+
+    #[arg(long, required_unless_present = "load_report")]
+    assignment: Option<String>,
+
+    #[arg(long, required_unless_present = "load_report")]
+    question: Option<String>,
+
+    #[arg(long, required_unless_present = "load_report")]
+    cell_id: Option<String>,
+
+    #[arg(long, value_enum, required_unless_present = "load_report")]
+    language: Option<Language>,
 
     #[arg(long)]
-    assignment: String,
-
-    #[arg(long)]
-    question: String,
-
-    #[arg(long)]
-    cell_id: String,
-
-    #[arg(long, value_enum)]
-    language: Language,
+    load_report: Option<PathBuf>,
 
     #[arg(long, default_value_t = 0.85)]
     threshold: f64,
@@ -72,7 +75,7 @@ struct Cli {
     tui: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Language {
     C,
@@ -89,7 +92,7 @@ struct Submission {
     normalized: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairScore {
     student_a: String,
     student_b: String,
@@ -98,40 +101,67 @@ struct PairScore {
     notebook_b: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ReportConfig {
     root_dir: String,
     assignment: String,
     question: String,
     cell_id: String,
     language: Language,
+    #[serde(default = "default_threshold")]
     threshold: f64,
+    #[serde(default = "default_max_results")]
     max_results: usize,
     solution_dir: Option<String>,
     solution_notebook: Option<String>,
     solution_threshold: Option<f64>,
     target_student: Option<String>,
+    #[serde(default)]
     table_only_high: bool,
+    #[serde(default)]
     lowercase: bool,
+    #[serde(default)]
     tui: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Report {
     config: ReportConfig,
     submission_count: usize,
     pair_count: usize,
+    #[serde(default)]
     excluded_high_pairs_due_to_solution: usize,
     high_similarity_count: usize,
     warnings: Vec<String>,
     high_similarity_pairs: Vec<PairScore>,
     all_pairs_sorted: Vec<PairScore>,
+    #[serde(default)]
+    pair_sources: HashMap<String, String>,
+    #[serde(default)]
+    deleted_pair_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct SolutionSubmission {
     notebook_path: PathBuf,
     normalized: String,
+}
+
+#[derive(Debug, Clone)]
+struct QuerySpec {
+    root_dir: PathBuf,
+    assignment: String,
+    question: String,
+    cell_id: String,
+    language: Language,
+}
+
+fn default_threshold() -> f64 {
+    0.85
+}
+
+fn default_max_results() -> usize {
+    100
 }
 
 fn main() {
@@ -145,103 +175,150 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
     validate_args(&cli)?;
 
-    let mut warnings = Vec::new();
-    let submissions = collect_submissions(&cli, &mut warnings)?;
-    if submissions.len() < 2 {
-        return Err(format!(
-            "found {} matching submission(s); need at least 2",
-            submissions.len()
-        ));
-    }
-    let source_by_notebook: HashMap<String, String> = submissions
-        .iter()
-        .map(|submission| {
-            (
-                submission.notebook_path.display().to_string(),
-                submission.source.clone(),
-            )
-        })
-        .collect();
-    let solution_submission = collect_solution_submission(&cli, &mut warnings)?;
-    if let Some(solution) = &solution_submission {
-        warnings.push(format!(
-            "solution notebook used: {}",
-            solution.notebook_path.display()
-        ));
-    }
-    let solution_threshold = cli.solution_threshold.unwrap_or(cli.threshold);
-
-    let all_pairs_initial = compute_pair_scores(&submissions, cli.target_student.as_deref());
-    let (all_pairs, excluded_high_pairs_due_to_solution) =
-        if let Some(solution) = &solution_submission {
-            let similarity_to_solution =
-                submission_similarity_to_solution(&submissions, &solution.normalized);
-            filter_pairs_by_solution_similarity(
-                all_pairs_initial,
-                &similarity_to_solution,
-                cli.threshold,
-                solution_threshold,
-            )
-        } else {
-            (all_pairs_initial, 0)
-        };
-    if excluded_high_pairs_due_to_solution > 0 {
-        warnings.push(format!(
-            "excluded {excluded_high_pairs_due_to_solution} high-similarity pair(s) because one or both submissions were also highly similar to the solution"
-        ));
-    }
-    let mut high_pairs: Vec<PairScore> = all_pairs
-        .iter()
-        .filter(|pair| pair.score >= cli.threshold)
-        .cloned()
-        .collect();
-    high_pairs.sort_by(sort_scores_desc);
-
-    if cli.tui {
-        run_tui(
-            &all_pairs,
-            &source_by_notebook,
-            cli.threshold,
-            cli.max_results,
-            cli.table_only_high,
-        )?;
+    let mut report = if let Some(load_path) = &cli.load_report {
+        load_report(load_path)?
     } else {
+        let query = query_spec_from_cli(&cli)?;
+        let mut warnings = Vec::new();
+        let submissions = collect_submissions(&query, cli.lowercase, &mut warnings)?;
+        if submissions.len() < 2 {
+            return Err(format!(
+                "found {} matching submission(s); need at least 2",
+                submissions.len()
+            ));
+        }
+        let source_by_notebook: HashMap<String, String> = submissions
+            .iter()
+            .map(|submission| {
+                (
+                    submission.notebook_path.display().to_string(),
+                    submission.source.clone(),
+                )
+            })
+            .collect();
+        let solution_submission = collect_solution_submission(&cli, &query, &mut warnings)?;
+        if let Some(solution) = &solution_submission {
+            warnings.push(format!(
+                "solution notebook used: {}",
+                solution.notebook_path.display()
+            ));
+        }
+        let solution_threshold = cli.solution_threshold.unwrap_or(cli.threshold);
+
+        let all_pairs_initial = compute_pair_scores(&submissions, cli.target_student.as_deref());
+        let (all_pairs, excluded_high_pairs_due_to_solution) =
+            if let Some(solution) = &solution_submission {
+                let similarity_to_solution =
+                    submission_similarity_to_solution(&submissions, &solution.normalized);
+                filter_pairs_by_solution_similarity(
+                    all_pairs_initial,
+                    &similarity_to_solution,
+                    cli.threshold,
+                    solution_threshold,
+                )
+            } else {
+                (all_pairs_initial, 0)
+            };
+        if excluded_high_pairs_due_to_solution > 0 {
+            warnings.push(format!(
+                "excluded {excluded_high_pairs_due_to_solution} high-similarity pair(s) because one or both submissions were also highly similar to the solution"
+            ));
+        }
+        let mut high_pairs: Vec<PairScore> = all_pairs
+            .iter()
+            .filter(|pair| pair.score >= cli.threshold)
+            .cloned()
+            .collect();
+        high_pairs.sort_by(sort_scores_desc);
+        Report {
+            config: ReportConfig {
+                root_dir: query.root_dir.display().to_string(),
+                assignment: query.assignment,
+                question: query.question,
+                cell_id: query.cell_id,
+                language: query.language,
+                threshold: cli.threshold,
+                max_results: cli.max_results,
+                solution_dir: cli.solution_dir.clone().map(|p| p.display().to_string()),
+                solution_notebook: solution_submission
+                    .as_ref()
+                    .map(|s| s.notebook_path.display().to_string()),
+                solution_threshold: solution_submission.as_ref().map(|_| solution_threshold),
+                target_student: cli.target_student.clone(),
+                table_only_high: cli.table_only_high,
+                lowercase: cli.lowercase,
+                tui: cli.tui,
+            },
+            submission_count: submissions.len(),
+            pair_count: all_pairs.len(),
+            excluded_high_pairs_due_to_solution,
+            high_similarity_count: high_pairs.len(),
+            warnings,
+            high_similarity_pairs: high_pairs,
+            all_pairs_sorted: all_pairs,
+            pair_sources: source_by_notebook,
+            deleted_pair_keys: Vec::new(),
+        }
+    };
+
+    let effective_threshold = if cli.load_report.is_some()
+        && (cli.threshold - default_threshold()).abs() < f64::EPSILON
+    {
+        report.config.threshold
+    } else {
+        cli.threshold
+    };
+    let effective_max_results =
+        if cli.load_report.is_some() && cli.max_results == default_max_results() {
+            report.config.max_results
+        } else {
+            cli.max_results
+        };
+
+    let mut deleted_pair_keys: HashSet<String> = report.deleted_pair_keys.iter().cloned().collect();
+    if cli.tui {
+        deleted_pair_keys = run_tui(
+            &report.all_pairs_sorted,
+            &report.pair_sources,
+            effective_threshold,
+            effective_max_results,
+            cli.table_only_high,
+            &deleted_pair_keys,
+        )?;
+    }
+
+    let active_pairs = apply_deleted_pairs(&report.all_pairs_sorted, &deleted_pair_keys);
+    if !cli.tui {
         print_table(
-            &all_pairs,
-            cli.threshold,
-            cli.max_results,
+            &active_pairs,
+            effective_threshold,
+            effective_max_results,
             cli.table_only_high,
         );
     }
-    print_warnings(&warnings);
-
-    let report = Report {
-        config: ReportConfig {
-            root_dir: cli.root_dir.display().to_string(),
-            assignment: cli.assignment,
-            question: cli.question,
-            cell_id: cli.cell_id,
-            language: cli.language,
-            threshold: cli.threshold,
-            max_results: cli.max_results,
-            solution_dir: cli.solution_dir.map(|p| p.display().to_string()),
-            solution_notebook: solution_submission
-                .as_ref()
-                .map(|s| s.notebook_path.display().to_string()),
-            solution_threshold: solution_submission.as_ref().map(|_| solution_threshold),
-            target_student: cli.target_student,
-            table_only_high: cli.table_only_high,
-            lowercase: cli.lowercase,
-            tui: cli.tui,
-        },
-        submission_count: submissions.len(),
-        pair_count: all_pairs.len(),
-        excluded_high_pairs_due_to_solution,
-        high_similarity_count: high_pairs.len(),
-        warnings,
-        high_similarity_pairs: high_pairs,
-        all_pairs_sorted: all_pairs,
-    };
+    let hidden_count = deleted_pair_keys.len();
+    if cli.tui && hidden_count > 0 {
+        report.warnings.push(format!(
+            "hidden {hidden_count} pair(s) from TUI session before saving report"
+        ));
+    }
+    report.deleted_pair_keys = deleted_pair_keys.into_iter().collect();
+    report.deleted_pair_keys.sort();
+    let deleted_pair_set: HashSet<String> = report.deleted_pair_keys.iter().cloned().collect();
+    report.pair_count = active_pairs.len();
+    report.high_similarity_pairs = report
+        .all_pairs_sorted
+        .iter()
+        .filter(|pair| !deleted_pair_set.contains(&pair_key(pair)))
+        .filter(|pair| pair.score >= effective_threshold)
+        .cloned()
+        .collect();
+    report.high_similarity_count = report.high_similarity_pairs.len();
+    report.config.threshold = effective_threshold;
+    report.config.max_results = effective_max_results;
+    report.config.table_only_high = cli.table_only_high;
+    report.config.tui = cli.tui;
+    print_warnings(&report.warnings);
 
     let json = serde_json::to_string_pretty(&report)
         .map_err(|e| format!("failed to serialize report JSON: {e}"))?;
@@ -285,19 +362,69 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     if cli.solution_threshold.is_some() && cli.solution_dir.is_none() {
         return Err("solution-threshold requires --solution-dir".to_owned());
     }
-    if !cli.root_dir.is_dir() {
+    if let Some(root_dir) = &cli.root_dir
+        && !root_dir.is_dir()
+    {
         return Err(format!(
             "root directory does not exist or is not a directory: {}",
-            cli.root_dir.display()
+            root_dir.display()
+        ));
+    }
+    if let Some(load_report) = &cli.load_report
+        && !load_report.is_file()
+    {
+        return Err(format!(
+            "load-report file does not exist: {}",
+            load_report.display()
         ));
     }
     Ok(())
 }
 
-fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Submission>, String> {
+fn query_spec_from_cli(cli: &Cli) -> Result<QuerySpec, String> {
+    let root_dir = cli
+        .root_dir
+        .clone()
+        .ok_or_else(|| "--root-dir is required unless --load-report is used".to_owned())?;
+    let assignment = cli
+        .assignment
+        .clone()
+        .ok_or_else(|| "--assignment is required unless --load-report is used".to_owned())?;
+    let question = cli
+        .question
+        .clone()
+        .ok_or_else(|| "--question is required unless --load-report is used".to_owned())?;
+    let cell_id = cli
+        .cell_id
+        .clone()
+        .ok_or_else(|| "--cell-id is required unless --load-report is used".to_owned())?;
+    let language = cli
+        .language
+        .ok_or_else(|| "--language is required unless --load-report is used".to_owned())?;
+    Ok(QuerySpec {
+        root_dir,
+        assignment,
+        question,
+        cell_id,
+        language,
+    })
+}
+
+fn load_report(path: &Path) -> Result<Report, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("failed reading report {}: {e}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("failed parsing report JSON {}: {e}", path.display()))
+}
+
+fn collect_submissions(
+    query: &QuerySpec,
+    lowercase: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Submission>, String> {
     let mut submissions = Vec::new();
 
-    let student_dirs = list_immediate_subdirs(&cli.root_dir)
+    let student_dirs = list_immediate_subdirs(&query.root_dir)
         .map_err(|e| format!("failed to list students: {e}"))?;
 
     for student_dir in student_dirs {
@@ -312,7 +439,7 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
             })?
             .to_owned();
 
-        let assignment_dir = student_dir.join(&cli.assignment);
+        let assignment_dir = student_dir.join(&query.assignment);
         if !assignment_dir.is_dir() {
             warnings.push(format!(
                 "student '{student_name}': assignment directory missing: {}",
@@ -321,8 +448,8 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
             continue;
         }
 
-        let matching_notebooks =
-            find_matching_notebooks(&assignment_dir, &cli.question).map_err(|e| {
+        let matching_notebooks = find_matching_notebooks(&assignment_dir, &query.question)
+            .map_err(|e| {
                 format!(
                     "failed to search notebooks in {}: {e}",
                     assignment_dir.display()
@@ -332,7 +459,7 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
         if matching_notebooks.is_empty() {
             warnings.push(format!(
                 "student '{student_name}': no notebook filename contains '{}'",
-                cli.question
+                query.question
             ));
             continue;
         }
@@ -341,20 +468,21 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
         if matching_notebooks.len() > 1 {
             warnings.push(format!(
                 "student '{student_name}': multiple notebooks matched question '{}'; using {}",
-                cli.question,
+                query.question,
                 notebook_path.display()
             ));
         }
 
-        let source = extract_cell_source_by_grade_id(notebook_path, &cli.cell_id).map_err(|e| {
-            format!(
-                "student '{student_name}': failed to extract grade_id '{}' from {}: {e}",
-                cli.cell_id,
-                notebook_path.display()
-            )
-        })?;
+        let source =
+            extract_cell_source_by_grade_id(notebook_path, &query.cell_id).map_err(|e| {
+                format!(
+                    "student '{student_name}': failed to extract grade_id '{}' from {}: {e}",
+                    query.cell_id,
+                    notebook_path.display()
+                )
+            })?;
 
-        let normalized = normalize_code(&source, cli.language, cli.lowercase);
+        let normalized = normalize_code(&source, query.language, lowercase);
         submissions.push(Submission {
             student: student_name,
             notebook_path: notebook_path.clone(),
@@ -368,12 +496,13 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
 
 fn collect_solution_submission(
     cli: &Cli,
+    query: &QuerySpec,
     warnings: &mut Vec<String>,
 ) -> Result<Option<SolutionSubmission>, String> {
     let Some(solution_dir) = &cli.solution_dir else {
         return Ok(None);
     };
-    let assignment_dir = solution_dir.join(&cli.assignment);
+    let assignment_dir = solution_dir.join(&query.assignment);
     if !assignment_dir.is_dir() {
         return Err(format!(
             "solution assignment directory missing: {}",
@@ -381,7 +510,7 @@ fn collect_solution_submission(
         ));
     }
     let matching_notebooks =
-        find_matching_notebooks(&assignment_dir, &cli.question).map_err(|e| {
+        find_matching_notebooks(&assignment_dir, &query.question).map_err(|e| {
             format!(
                 "failed to search solution notebooks in {}: {e}",
                 assignment_dir.display()
@@ -390,25 +519,25 @@ fn collect_solution_submission(
     if matching_notebooks.is_empty() {
         return Err(format!(
             "solution directory has no notebook filename containing '{}'",
-            cli.question
+            query.question
         ));
     }
     let notebook_path = &matching_notebooks[0];
     if matching_notebooks.len() > 1 {
         warnings.push(format!(
             "solution directory: multiple notebooks matched question '{}'; using {}",
-            cli.question,
+            query.question,
             notebook_path.display()
         ));
     }
-    let source = extract_cell_source_by_grade_id(notebook_path, &cli.cell_id).map_err(|e| {
+    let source = extract_cell_source_by_grade_id(notebook_path, &query.cell_id).map_err(|e| {
         format!(
             "solution directory: failed to extract grade_id '{}' from {}: {e}",
-            cli.cell_id,
+            query.cell_id,
             notebook_path.display()
         )
     })?;
-    let normalized = normalize_code(&source, cli.language, cli.lowercase);
+    let normalized = normalize_code(&source, query.language, cli.lowercase);
     Ok(Some(SolutionSubmission {
         notebook_path: notebook_path.clone(),
         normalized,
@@ -922,7 +1051,8 @@ fn run_tui(
     threshold: f64,
     max_results: usize,
     start_high_only: bool,
-) -> Result<(), String> {
+    initial_hidden_pair_keys: &HashSet<String>,
+) -> Result<HashSet<String>, String> {
     enable_raw_mode().map_err(|e| format!("failed to enable raw mode: {e}"))?;
     execute!(stdout(), EnterAlternateScreen, Hide)
         .map_err(|e| format!("failed to switch to alternate screen: {e}"))?;
@@ -937,6 +1067,7 @@ fn run_tui(
         threshold,
         max_results,
         start_high_only,
+        initial_hidden_pair_keys,
     );
 
     disable_raw_mode().map_err(|e| format!("failed to disable raw mode: {e}"))?;
@@ -956,14 +1087,30 @@ fn run_tui_loop(
     threshold: f64,
     max_results: usize,
     start_high_only: bool,
-) -> Result<(), String> {
+    initial_hidden_pair_keys: &HashSet<String>,
+) -> Result<HashSet<String>, String> {
     let mut selected = 0usize;
     let mut high_only = start_high_only;
+    let mut show_deleted = false;
     let mut screen = TuiScreen::List;
     let mut list_state = ListState::default();
+    let mut hidden_pair_keys: HashSet<String> = initial_hidden_pair_keys.clone();
+    let mut hidden_history: Vec<String> = Vec::new();
 
     loop {
-        let rows = tui_rows(all_pairs, threshold, max_results, high_only);
+        let active_rows = tui_rows(
+            all_pairs,
+            threshold,
+            max_results,
+            high_only,
+            &hidden_pair_keys,
+        );
+        let deleted_rows = tui_deleted_rows(all_pairs, max_results, &hidden_pair_keys);
+        let rows = if show_deleted {
+            &deleted_rows
+        } else {
+            &active_rows
+        };
         if rows.is_empty() {
             selected = 0;
         } else if selected >= rows.len() {
@@ -982,6 +1129,8 @@ fn run_tui_loop(
                     threshold,
                     max_results,
                     high_only,
+                    show_deleted,
+                    deleted_rows.len(),
                     screen,
                 )
             })
@@ -1027,15 +1176,42 @@ fn run_tui_loop(
                     high_only = !high_only;
                     selected = 0;
                 }
+                KeyCode::Char('v') => {
+                    show_deleted = !show_deleted;
+                    selected = 0;
+                }
+                KeyCode::Char('u') => {
+                    undo_last_hidden(&mut hidden_pair_keys, &mut hidden_history);
+                }
                 KeyCode::Enter => {
                     if !rows.is_empty() {
                         screen = TuiScreen::Compare { scroll: 0 };
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                    if !rows.is_empty() && !show_deleted {
+                        let key = pair_key(rows[selected]);
+                        if hidden_pair_keys.insert(key.clone()) {
+                            hidden_history.push(key);
+                        }
+                        let max_idx = rows.len().saturating_sub(2);
+                        selected = selected.min(max_idx);
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if !rows.is_empty() && show_deleted {
+                        let key = pair_key(rows[selected]);
+                        hidden_pair_keys.remove(&key);
+                        hidden_history.retain(|k| k != &key);
                     }
                 }
                 _ => {}
             },
             TuiScreen::Compare { mut scroll } => match key.code {
                 KeyCode::Char('q') => break,
+                KeyCode::Char('u') => {
+                    undo_last_hidden(&mut hidden_pair_keys, &mut hidden_history);
+                }
                 KeyCode::Esc | KeyCode::Backspace => {
                     screen = TuiScreen::List;
                 }
@@ -1058,27 +1234,78 @@ fn run_tui_loop(
                 KeyCode::Home | KeyCode::Char('g') => {
                     screen = TuiScreen::Compare { scroll: 0 };
                 }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    if !rows.is_empty() {
+                        let key = pair_key(rows[selected]);
+                        if hidden_pair_keys.insert(key.clone()) {
+                            hidden_history.push(key);
+                        }
+                        screen = TuiScreen::List;
+                    }
+                }
                 _ => {}
             },
         }
     }
-    Ok(())
+    Ok(hidden_pair_keys)
 }
 
-fn tui_rows(
-    all_pairs: &[PairScore],
+fn tui_rows<'a>(
+    all_pairs: &'a [PairScore],
     threshold: f64,
     max_results: usize,
     high_only: bool,
-) -> Vec<&PairScore> {
+    hidden_pair_keys: &HashSet<String>,
+) -> Vec<&'a PairScore> {
+    let filtered = all_pairs
+        .iter()
+        .filter(|pair| !hidden_pair_keys.contains(&pair_key(pair)));
     if high_only {
-        all_pairs
-            .iter()
+        filtered
             .filter(|pair| pair.score >= threshold)
             .take(max_results)
             .collect()
     } else {
-        all_pairs.iter().take(max_results).collect()
+        filtered.take(max_results).collect()
+    }
+}
+
+fn tui_deleted_rows<'a>(
+    all_pairs: &'a [PairScore],
+    max_results: usize,
+    hidden_pair_keys: &HashSet<String>,
+) -> Vec<&'a PairScore> {
+    all_pairs
+        .iter()
+        .filter(|pair| hidden_pair_keys.contains(&pair_key(pair)))
+        .take(max_results)
+        .collect()
+}
+
+fn pair_key(pair: &PairScore) -> String {
+    format!("{}\u{1f}|{}", pair.notebook_a, pair.notebook_b)
+}
+
+fn apply_deleted_pairs(
+    all_pairs: &[PairScore],
+    deleted_pair_keys: &HashSet<String>,
+) -> Vec<PairScore> {
+    all_pairs
+        .iter()
+        .filter(|pair| !deleted_pair_keys.contains(&pair_key(pair)))
+        .cloned()
+        .collect()
+}
+
+fn undo_last_hidden(
+    hidden_pair_keys: &mut HashSet<String>,
+    hidden_history: &mut Vec<String>,
+) -> bool {
+    if let Some(last) = hidden_history.pop() {
+        hidden_pair_keys.remove(&last);
+        true
+    } else {
+        false
     }
 }
 
@@ -1091,6 +1318,8 @@ fn render_tui(
     threshold: f64,
     max_results: usize,
     high_only: bool,
+    show_deleted: bool,
+    deleted_count: usize,
     screen: TuiScreen,
 ) {
     let root = frame.area();
@@ -1110,6 +1339,11 @@ fn render_tui(
             } else {
                 "Showing top scores"
             };
+            let view_mode = if show_deleted {
+                "Viewing deleted pairs"
+            } else {
+                "Viewing active pairs"
+            };
             let header = Paragraph::new(Line::from(vec![
                 Span::styled(
                     "Submission Similarity Viewer",
@@ -1118,7 +1352,7 @@ fn render_tui(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
-                    "  |  threshold={threshold:.2}  max={max_results}  |  {mode}"
+                    "  |  threshold={threshold:.2}  max={max_results}  |  {mode}  |  {view_mode}  |  deleted={deleted_count}"
                 )),
             ]))
             .block(Block::default().borders(Borders::ALL).title("Overview"));
@@ -1153,7 +1387,15 @@ fn render_tui(
                 .collect();
 
             let list = List::new(list_items)
-                .block(Block::default().borders(Borders::ALL).title("Pairs (left)"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if show_deleted {
+                            "Deleted Pairs (left)"
+                        } else {
+                            "Pairs (left)"
+                        }),
+                )
                 .highlight_style(
                     Style::default()
                         .bg(Color::Blue)
@@ -1232,6 +1474,10 @@ fn render_tui(
                 Span::raw("PgUp/PgDn jump  "),
                 Span::raw("Home/End  "),
                 Span::raw("h/f filter  "),
+                Span::raw("v toggle deleted view  "),
+                Span::raw("d/Del hide pair  "),
+                Span::raw("u undo hide  "),
+                Span::raw("r restore selected (deleted view)  "),
                 Span::raw("Live preview on right  "),
                 Span::raw("Enter full compare  "),
                 Span::styled("q/Esc quit", Style::default().add_modifier(Modifier::BOLD)),
@@ -1309,6 +1555,8 @@ fn render_tui(
                 Span::raw("↑/↓ j/k scroll  "),
                 Span::raw("PgUp/PgDn fast scroll  "),
                 Span::raw("Home top  "),
+                Span::raw("d/Del hide + back  "),
+                Span::raw("u undo hide  "),
                 Span::raw("Esc/Backspace back  "),
                 Span::styled("q quit", Style::default().add_modifier(Modifier::BOLD)),
             ]))
@@ -1364,7 +1612,13 @@ fn preview_source(source: &str, max_lines: usize, max_cols: usize) -> String {
 }
 
 fn print_table(all_pairs: &[PairScore], threshold: f64, max_results: usize, table_only_high: bool) {
-    let rows = tui_rows(all_pairs, threshold, max_results, table_only_high);
+    let rows = tui_rows(
+        all_pairs,
+        threshold,
+        max_results,
+        table_only_high,
+        &HashSet::new(),
+    );
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -1502,8 +1756,8 @@ def f():
                 notebook_b: "c.ipynb".to_owned(),
             },
         ];
-        assert_eq!(tui_rows(&pairs, 0.85, 10, true).len(), 1);
-        assert_eq!(tui_rows(&pairs, 0.85, 1, false).len(), 1);
+        assert_eq!(tui_rows(&pairs, 0.85, 10, true, &HashSet::new()).len(), 1);
+        assert_eq!(tui_rows(&pairs, 0.85, 1, false, &HashSet::new()).len(), 1);
     }
 
     #[test]
@@ -1562,5 +1816,16 @@ def f():
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].student_a, "carla");
         assert_eq!(kept[1].student_a, "erin");
+    }
+
+    #[test]
+    fn undo_last_hidden_restores_last_entry() {
+        let mut hidden = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        let mut history = vec!["a".to_owned(), "b".to_owned()];
+        let undone = undo_last_hidden(&mut hidden, &mut history);
+        assert!(undone);
+        assert!(!hidden.contains("b"));
+        assert!(hidden.contains("a"));
+        assert_eq!(history, vec!["a".to_owned()]);
     }
 }
