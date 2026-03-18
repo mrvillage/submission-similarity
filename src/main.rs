@@ -8,7 +8,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -1110,6 +1110,8 @@ fn run_tui_loop(
 ) -> Result<TuiEdits, String> {
     let mut selected = 0usize;
     let mut high_only = start_high_only;
+    let mut preview_scroll = 0u16;
+    let mut last_selected: Option<usize> = None;
     let mut show_deleted = false;
     let mut show_flagged_only = false;
     let mut screen = TuiScreen::List;
@@ -1138,8 +1140,14 @@ fn run_tui_loop(
         let flagged_submission_list = flagged_submissions(all_pairs, &flagged_pair_keys);
         if rows.is_empty() {
             selected = 0;
+            last_selected = None;
+            preview_scroll = 0;
         } else if selected >= rows.len() {
             selected = rows.len() - 1;
+        }
+        if last_selected != Some(selected) {
+            preview_scroll = 0;
+            last_selected = Some(selected);
         }
 
         list_state.select((!rows.is_empty()).then_some(selected));
@@ -1160,6 +1168,7 @@ fn run_tui_loop(
                     flagged_pair_keys.len(),
                     &flagged_submission_list,
                     &flagged_pair_keys,
+                    preview_scroll,
                     screen,
                 )
             })
@@ -1209,6 +1218,12 @@ fn run_tui_loop(
                     high_only = !high_only;
                     selected = 0;
                 }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    preview_scroll = preview_scroll.saturating_add(10);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    preview_scroll = preview_scroll.saturating_sub(10);
+                }
                 KeyCode::Char('p') => {
                     show_flagged_only = !show_flagged_only;
                     show_deleted = false;
@@ -1254,7 +1269,6 @@ fn run_tui_loop(
                         if !added.is_empty() {
                             hidden_history.push(added);
                         }
-                        selected = 0;
                     }
                 }
                 KeyCode::Char('B') => {
@@ -1267,7 +1281,6 @@ fn run_tui_loop(
                         if !added.is_empty() {
                             hidden_history.push(added);
                         }
-                        selected = 0;
                     }
                 }
                 KeyCode::Char('r') => {
@@ -1459,6 +1472,7 @@ fn render_tui(
     flagged_count: usize,
     flagged_submission_list: &[String],
     flagged_pair_keys: &HashSet<String>,
+    preview_scroll: u16,
     screen: TuiScreen,
 ) {
     let root = frame.area();
@@ -1608,6 +1622,7 @@ fn render_tui(
                             shorten(&flagged_submission_list.join(", "), 120)
                         }
                     )),
+                    Line::from(format!("Preview scroll: {}", preview_scroll)),
                 ])
                 .block(
                     Block::default()
@@ -1624,20 +1639,30 @@ fn render_tui(
                 let max_lines = source_cols[0].height.saturating_sub(2) as usize;
                 let max_cols = source_cols[0].width.saturating_sub(2) as usize;
 
-                let preview_a = Paragraph::new(preview_source(source_a, max_lines, max_cols))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!("{} source", pair.student_a)),
-                    )
-                    .wrap(Wrap { trim: false });
-                let preview_b = Paragraph::new(preview_source(source_b, max_lines, max_cols))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!("{} source", pair.student_b)),
-                    )
-                    .wrap(Wrap { trim: false });
+                let preview_a = Paragraph::new(preview_source(
+                    source_a,
+                    preview_scroll,
+                    max_lines,
+                    max_cols,
+                ))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("{} source", pair.student_a)),
+                )
+                .wrap(Wrap { trim: false });
+                let preview_b = Paragraph::new(preview_source(
+                    source_b,
+                    preview_scroll,
+                    max_lines,
+                    max_cols,
+                ))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("{} source", pair.student_b)),
+                )
+                .wrap(Wrap { trim: false });
                 frame.render_widget(preview_a, source_cols[0]);
                 frame.render_widget(preview_b, source_cols[1]);
             }
@@ -1647,7 +1672,7 @@ fn render_tui(
                     "Move: ↑/↓ j/k | Jump: PgUp/PgDn Home/End | View: h/f high, p flagged, v deleted",
                 ),
                 Line::from(
-                    "Actions: s suspicious, d/Delete hide, A/B hide by student, u undo, r restore (deleted), Enter compare, ? help, q quit",
+                    "Actions: s suspicious, d/Delete hide, A/B hide by student, u undo, r restore (deleted), Ctrl+d/u preview scroll, Enter compare, ? help, q quit",
                 ),
             ])
             .block(Block::default().borders(Borders::ALL).title("Controls"))
@@ -1770,6 +1795,7 @@ fn render_tui(
                 Line::from("  B: hide all pairs involving selected student B"),
                 Line::from("  u: undo last hide action"),
                 Line::from("  r: restore selected pair (deleted view only)"),
+                Line::from("  Ctrl+d / Ctrl+u: scroll preview panes down/up"),
                 Line::from(""),
                 Line::from("Compare View"),
                 Line::from("  ↑/↓ or j/k: scroll sources"),
@@ -1813,13 +1839,13 @@ fn shorten(input: &str, max_chars: usize) -> String {
     out
 }
 
-fn preview_source(source: &str, max_lines: usize, max_cols: usize) -> String {
+fn preview_source(source: &str, start_line: u16, max_lines: usize, max_cols: usize) -> String {
     if max_lines == 0 || max_cols == 0 {
         return String::new();
     }
     let mut out = String::new();
     let mut count = 0usize;
-    for (idx, line) in source.lines().enumerate() {
+    for (idx, line) in source.lines().enumerate().skip(start_line as usize) {
         if count >= max_lines {
             break;
         }
@@ -1830,7 +1856,7 @@ fn preview_source(source: &str, max_lines: usize, max_cols: usize) -> String {
         out.push('\n');
         count += 1;
     }
-    let total_lines = source.lines().count();
+    let total_lines = source.lines().count().saturating_sub(start_line as usize);
     if total_lines > count && count > 0 {
         let marker = "...";
         let last_line_width = max_cols.min(marker.len());
@@ -2027,11 +2053,21 @@ def f():
     #[test]
     fn preview_source_limits_lines_and_columns() {
         let src = "first very very long line\nsecond line\nthird line";
-        let preview = preview_source(src, 2, 12);
+        let preview = preview_source(src, 0, 2, 12);
         assert!(preview.contains("1:"));
         assert!(preview.contains("2:"));
         assert!(preview.contains("..."));
         assert!(!preview.contains("third line"));
+    }
+
+    #[test]
+    fn preview_source_respects_start_line() {
+        let src = "line1\nline2\nline3\nline4";
+        let preview = preview_source(src, 2, 2, 20);
+        assert!(!preview.contains("line1"));
+        assert!(!preview.contains("line2"));
+        assert!(preview.contains("line3"));
+        assert!(preview.contains("line4"));
     }
 
     #[test]
