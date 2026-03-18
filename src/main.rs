@@ -54,6 +54,12 @@ struct Cli {
     json_output: PathBuf,
 
     #[arg(long)]
+    solution_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    solution_threshold: Option<f64>,
+
+    #[arg(long)]
     target_student: Option<String>,
 
     #[arg(long, default_value_t = false)]
@@ -101,6 +107,9 @@ struct ReportConfig {
     language: Language,
     threshold: f64,
     max_results: usize,
+    solution_dir: Option<String>,
+    solution_notebook: Option<String>,
+    solution_threshold: Option<f64>,
     target_student: Option<String>,
     table_only_high: bool,
     lowercase: bool,
@@ -112,10 +121,17 @@ struct Report {
     config: ReportConfig,
     submission_count: usize,
     pair_count: usize,
+    excluded_high_pairs_due_to_solution: usize,
     high_similarity_count: usize,
     warnings: Vec<String>,
     high_similarity_pairs: Vec<PairScore>,
     all_pairs_sorted: Vec<PairScore>,
+}
+
+#[derive(Debug, Clone)]
+struct SolutionSubmission {
+    notebook_path: PathBuf,
+    normalized: String,
 }
 
 fn main() {
@@ -146,8 +162,34 @@ fn run() -> Result<(), String> {
             )
         })
         .collect();
+    let solution_submission = collect_solution_submission(&cli, &mut warnings)?;
+    if let Some(solution) = &solution_submission {
+        warnings.push(format!(
+            "solution notebook used: {}",
+            solution.notebook_path.display()
+        ));
+    }
+    let solution_threshold = cli.solution_threshold.unwrap_or(cli.threshold);
 
-    let all_pairs = compute_pair_scores(&submissions, cli.target_student.as_deref());
+    let all_pairs_initial = compute_pair_scores(&submissions, cli.target_student.as_deref());
+    let (all_pairs, excluded_high_pairs_due_to_solution) =
+        if let Some(solution) = &solution_submission {
+            let similarity_to_solution =
+                submission_similarity_to_solution(&submissions, &solution.normalized);
+            filter_pairs_by_solution_similarity(
+                all_pairs_initial,
+                &similarity_to_solution,
+                cli.threshold,
+                solution_threshold,
+            )
+        } else {
+            (all_pairs_initial, 0)
+        };
+    if excluded_high_pairs_due_to_solution > 0 {
+        warnings.push(format!(
+            "excluded {excluded_high_pairs_due_to_solution} high-similarity pair(s) because one or both submissions were also highly similar to the solution"
+        ));
+    }
     let mut high_pairs: Vec<PairScore> = all_pairs
         .iter()
         .filter(|pair| pair.score >= cli.threshold)
@@ -182,6 +224,11 @@ fn run() -> Result<(), String> {
             language: cli.language,
             threshold: cli.threshold,
             max_results: cli.max_results,
+            solution_dir: cli.solution_dir.map(|p| p.display().to_string()),
+            solution_notebook: solution_submission
+                .as_ref()
+                .map(|s| s.notebook_path.display().to_string()),
+            solution_threshold: solution_submission.as_ref().map(|_| solution_threshold),
             target_student: cli.target_student,
             table_only_high: cli.table_only_high,
             lowercase: cli.lowercase,
@@ -189,6 +236,7 @@ fn run() -> Result<(), String> {
         },
         submission_count: submissions.len(),
         pair_count: all_pairs.len(),
+        excluded_high_pairs_due_to_solution,
         high_similarity_count: high_pairs.len(),
         warnings,
         high_similarity_pairs: high_pairs,
@@ -217,6 +265,25 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     }
     if cli.max_results == 0 {
         return Err("max-results must be at least 1".to_owned());
+    }
+    if let Some(solution_dir) = &cli.solution_dir
+        && !solution_dir.is_dir()
+    {
+        return Err(format!(
+            "solution directory does not exist or is not a directory: {}",
+            solution_dir.display()
+        ));
+    }
+    if let Some(solution_threshold) = cli.solution_threshold
+        && !(0.0..=1.0).contains(&solution_threshold)
+    {
+        return Err(format!(
+            "solution-threshold must be between 0.0 and 1.0, got {}",
+            solution_threshold
+        ));
+    }
+    if cli.solution_threshold.is_some() && cli.solution_dir.is_none() {
+        return Err("solution-threshold requires --solution-dir".to_owned());
     }
     if !cli.root_dir.is_dir() {
         return Err(format!(
@@ -297,6 +364,55 @@ fn collect_submissions(cli: &Cli, warnings: &mut Vec<String>) -> Result<Vec<Subm
     }
 
     Ok(submissions)
+}
+
+fn collect_solution_submission(
+    cli: &Cli,
+    warnings: &mut Vec<String>,
+) -> Result<Option<SolutionSubmission>, String> {
+    let Some(solution_dir) = &cli.solution_dir else {
+        return Ok(None);
+    };
+    let assignment_dir = solution_dir.join(&cli.assignment);
+    if !assignment_dir.is_dir() {
+        return Err(format!(
+            "solution assignment directory missing: {}",
+            assignment_dir.display()
+        ));
+    }
+    let matching_notebooks =
+        find_matching_notebooks(&assignment_dir, &cli.question).map_err(|e| {
+            format!(
+                "failed to search solution notebooks in {}: {e}",
+                assignment_dir.display()
+            )
+        })?;
+    if matching_notebooks.is_empty() {
+        return Err(format!(
+            "solution directory has no notebook filename containing '{}'",
+            cli.question
+        ));
+    }
+    let notebook_path = &matching_notebooks[0];
+    if matching_notebooks.len() > 1 {
+        warnings.push(format!(
+            "solution directory: multiple notebooks matched question '{}'; using {}",
+            cli.question,
+            notebook_path.display()
+        ));
+    }
+    let source = extract_cell_source_by_grade_id(notebook_path, &cli.cell_id).map_err(|e| {
+        format!(
+            "solution directory: failed to extract grade_id '{}' from {}: {e}",
+            cli.cell_id,
+            notebook_path.display()
+        )
+    })?;
+    let normalized = normalize_code(&source, cli.language, cli.lowercase);
+    Ok(Some(SolutionSubmission {
+        notebook_path: notebook_path.clone(),
+        normalized,
+    }))
 }
 
 fn list_immediate_subdirs(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
@@ -407,6 +523,51 @@ fn compute_pair_scores(submissions: &[Submission], target_student: Option<&str>)
 
     pairs.sort_by(sort_scores_desc);
     pairs
+}
+
+fn submission_similarity_to_solution(
+    submissions: &[Submission],
+    normalized_solution: &str,
+) -> HashMap<String, f64> {
+    submissions
+        .iter()
+        .map(|submission| {
+            (
+                submission.notebook_path.display().to_string(),
+                cosine_similarity_3gram(&submission.normalized, normalized_solution),
+            )
+        })
+        .collect()
+}
+
+fn filter_pairs_by_solution_similarity(
+    all_pairs: Vec<PairScore>,
+    similarity_to_solution: &HashMap<String, f64>,
+    high_pair_threshold: f64,
+    solution_threshold: f64,
+) -> (Vec<PairScore>, usize) {
+    let mut excluded = 0usize;
+    let kept: Vec<PairScore> = all_pairs
+        .into_iter()
+        .filter(|pair| {
+            let pair_is_high = pair.score >= high_pair_threshold;
+            if !pair_is_high {
+                return true;
+            }
+            let a_high = similarity_to_solution
+                .get(&pair.notebook_a)
+                .is_some_and(|score| *score >= solution_threshold);
+            let b_high = similarity_to_solution
+                .get(&pair.notebook_b)
+                .is_some_and(|score| *score >= solution_threshold);
+            let should_exclude = a_high || b_high;
+            if should_exclude {
+                excluded += 1;
+            }
+            !should_exclude
+        })
+        .collect();
+    (kept, excluded)
 }
 
 fn sort_scores_desc(a: &PairScore, b: &PairScore) -> Ordering {
@@ -1270,5 +1431,47 @@ def f():
     fn clip_shortens_long_text() {
         let clipped = shorten("abcdefghijklmnopqrstuvwxyz", 10);
         assert_eq!(clipped, "abcdefg...");
+    }
+
+    #[test]
+    fn filters_high_pairs_that_match_solution() {
+        let pairs = vec![
+            PairScore {
+                student_a: "alice".to_owned(),
+                student_b: "bob".to_owned(),
+                score: 0.95,
+                notebook_a: "a.ipynb".to_owned(),
+                notebook_b: "b.ipynb".to_owned(),
+            },
+            PairScore {
+                student_a: "carla".to_owned(),
+                student_b: "diego".to_owned(),
+                score: 0.92,
+                notebook_a: "c.ipynb".to_owned(),
+                notebook_b: "d.ipynb".to_owned(),
+            },
+            PairScore {
+                student_a: "erin".to_owned(),
+                student_b: "frank".to_owned(),
+                score: 0.40,
+                notebook_a: "e.ipynb".to_owned(),
+                notebook_b: "f.ipynb".to_owned(),
+            },
+        ];
+        let similarity_to_solution = HashMap::from([
+            ("a.ipynb".to_owned(), 0.90),
+            ("b.ipynb".to_owned(), 0.20),
+            ("c.ipynb".to_owned(), 0.30),
+            ("d.ipynb".to_owned(), 0.35),
+            ("e.ipynb".to_owned(), 0.99),
+            ("f.ipynb".to_owned(), 0.01),
+        ]);
+
+        let (kept, excluded) =
+            filter_pairs_by_solution_similarity(pairs, &similarity_to_solution, 0.85, 0.85);
+        assert_eq!(excluded, 1);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].student_a, "carla");
+        assert_eq!(kept[1].student_a, "erin");
     }
 }

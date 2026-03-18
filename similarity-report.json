@@ -1,0 +1,127 @@
+{
+  "config": {
+    "root_dir": "sample-submissions",
+    "assignment": "A1",
+    "question": "fibonacci",
+    "cell_id": "cell42",
+    "language": "python",
+    "threshold": 0.85,
+    "max_results": 100,
+    "solution_dir": "sample-solution",
+    "solution_notebook": "sample-solution/A1/question-fibonacci.ipynb",
+    "solution_threshold": 0.85,
+    "target_student": null,
+    "table_only_high": false,
+    "lowercase": false,
+    "tui": true
+  },
+  "submission_count": 6,
+  "pair_count": 14,
+  "excluded_high_pairs_due_to_solution": 1,
+  "high_similarity_count": 0,
+  "warnings": [
+    "solution notebook used: sample-solution/A1/question-fibonacci.ipynb",
+    "excluded 1 high-similarity pair(s) because one or both submissions were also highly similar to the solution"
+  ],
+  "high_similarity_pairs": [],
+  "all_pairs_sorted": [
+    {
+      "student_a": "carla",
+      "student_b": "diego",
+      "score": 0.6887004431501819,
+      "notebook_a": "sample-submissions/carla/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/diego/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "erin",
+      "student_b": "frank",
+      "score": 0.6589604006570425,
+      "notebook_a": "sample-submissions/erin/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/frank/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "alice",
+      "student_b": "carla",
+      "score": 0.3008868813366604,
+      "notebook_a": "sample-submissions/alice/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/carla/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "bob",
+      "student_b": "carla",
+      "score": 0.3008868813366604,
+      "notebook_a": "sample-submissions/bob/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/carla/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "alice",
+      "student_b": "diego",
+      "score": 0.2699325253019577,
+      "notebook_a": "sample-submissions/alice/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/diego/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "bob",
+      "student_b": "diego",
+      "score": 0.2699325253019577,
+      "notebook_a": "sample-submissions/bob/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/diego/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "diego",
+      "student_b": "erin",
+      "score": 0.226479537619848,
+      "notebook_a": "sample-submissions/diego/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/erin/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "bob",
+      "student_b": "erin",
+      "score": 0.22201365014774876,
+      "notebook_a": "sample-submissions/bob/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/erin/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "carla",
+      "student_b": "erin",
+      "score": 0.18881372801234028,
+      "notebook_a": "sample-submissions/carla/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/erin/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "diego",
+      "student_b": "frank",
+      "score": 0.18160278964135773,
+      "notebook_a": "sample-submissions/diego/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/frank/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "alice",
+      "student_b": "erin",
+      "score": 0.18090001123149899,
+      "notebook_a": "sample-submissions/alice/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/erin/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "bob",
+      "student_b": "frank",
+      "score": 0.1473818942516018,
+      "notebook_a": "sample-submissions/bob/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/frank/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "carla",
+      "student_b": "frank",
+      "score": 0.1438304099588092,
+      "notebook_a": "sample-submissions/carla/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/frank/A1/question-fibonacci.ipynb"
+    },
+    {
+      "student_a": "alice",
+      "student_b": "frank",
+      "score": 0.12527461011386154,
+      "notebook_a": "sample-submissions/alice/A1/question-fibonacci.ipynb",
+      "notebook_b": "sample-submissions/frank/A1/question-fibonacci.ipynb"
+    }
+  ]
+}
