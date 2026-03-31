@@ -73,6 +73,25 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     tui: bool,
+
+    #[arg(
+        long,
+        help = "Path to a notebook file containing boilerplate code to filter out"
+    )]
+    boilerplate_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "nbgrader cell ID in the boilerplate file to extract (required with --boilerplate-file)"
+    )]
+    boilerplate_cell_id: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        help = "Auto-detect boilerplate: 3-grams present in this fraction (0.0-1.0) of submissions are removed. 0 = disabled, 0.9 = remove grams in 90%+ of submissions"
+    )]
+    boilerplate_auto_threshold: f64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
@@ -122,6 +141,12 @@ struct ReportConfig {
     lowercase: bool,
     #[serde(default)]
     tui: bool,
+    boilerplate_file: Option<String>,
+    boilerplate_cell_id: Option<String>,
+    #[serde(default)]
+    boilerplate_auto_threshold: f64,
+    #[serde(default)]
+    boilerplate_grams_removed: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,13 +213,29 @@ fn run() -> Result<(), String> {
     } else {
         let query = query_spec_from_cli(&cli)?;
         let mut warnings = Vec::new();
-        let submissions = collect_submissions(&query, cli.lowercase, &mut warnings)?;
+        let mut submissions = collect_submissions(&query, cli.lowercase, &mut warnings)?;
         if submissions.len() < 2 {
             return Err(format!(
                 "found {} matching submission(s); need at least 2",
                 submissions.len()
             ));
         }
+
+        // Boilerplate detection and removal
+        let boilerplate_grams = detect_boilerplate(&cli, &query, &submissions, &mut warnings)?;
+        let boilerplate_grams_count = boilerplate_grams.len();
+        
+        if !boilerplate_grams.is_empty() {
+            warnings.push(format!(
+                "removed {} boilerplate 3-gram(s) from all submissions",
+                boilerplate_grams_count
+            ));
+            // Apply boilerplate removal to all submissions
+            for submission in &mut submissions {
+                submission.normalized = remove_boilerplate_grams(&submission.normalized, &boilerplate_grams);
+            }
+        }
+
         let source_by_notebook: HashMap<String, String> = submissions
             .iter()
             .map(|submission| {
@@ -256,6 +297,10 @@ fn run() -> Result<(), String> {
                 table_only_high: cli.table_only_high,
                 lowercase: cli.lowercase,
                 tui: cli.tui,
+                boilerplate_file: cli.boilerplate_file.clone().map(|p| p.display().to_string()),
+                boilerplate_cell_id: cli.boilerplate_cell_id.clone(),
+                boilerplate_auto_threshold: cli.boilerplate_auto_threshold,
+                boilerplate_grams_removed: boilerplate_grams_count,
             },
             submission_count: submissions.len(),
             pair_count: all_pairs.len(),
@@ -559,6 +604,57 @@ fn collect_solution_submission(
     }))
 }
 
+fn detect_boilerplate(
+    cli: &Cli,
+    query: &QuerySpec,
+    submissions: &[Submission],
+    warnings: &mut Vec<String>,
+) -> Result<HashSet<[u8; 3]>, String> {
+    let mut all_boilerplate_grams = HashSet::new();
+
+    // Method 1: Load boilerplate from file if provided
+    if let Some(boilerplate_file) = &cli.boilerplate_file {
+        let cell_id = cli.boilerplate_cell_id.as_ref().ok_or_else(|| {
+            "boilerplate_file requires boilerplate_cell_id to be specified".to_string()
+        })?;
+
+        let source = extract_cell_source_by_grade_id(boilerplate_file, cell_id).map_err(|e| {
+            format!(
+                "failed to extract boilerplate from {} (cell '{}'): {e}",
+                boilerplate_file.display(),
+                cell_id
+            )
+        })?;
+
+        let normalized = normalize_code(&source, query.language, cli.lowercase);
+        let boilerplate_grams = extract_boilerplate_grams_from_source(&normalized);
+
+        warnings.push(format!(
+            "loaded {} boilerplate 3-gram(s) from {} (cell '{}')",
+            boilerplate_grams.len(),
+            boilerplate_file.display(),
+            cell_id
+        ));
+
+        all_boilerplate_grams.extend(boilerplate_grams);
+    }
+
+    // Method 2: Auto-detect boilerplate if threshold > 0
+    if cli.boilerplate_auto_threshold > 0.0 {
+        let auto_grams = detect_boilerplate_grams(submissions, cli.boilerplate_auto_threshold);
+
+        warnings.push(format!(
+            "auto-detected {} boilerplate 3-gram(s) present in {:.0}%+ of submissions",
+            auto_grams.len(),
+            cli.boilerplate_auto_threshold * 100.0
+        ));
+
+        all_boilerplate_grams.extend(auto_grams);
+    }
+
+    Ok(all_boilerplate_grams)
+}
+
 fn list_immediate_subdirs(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(root)? {
@@ -771,6 +867,71 @@ fn grams3(input: &str) -> HashMap<[u8; 3], usize> {
         *map.entry(gram).or_insert(0) += 1;
     }
     map
+}
+
+/// Detect boilerplate 3-grams that appear in a high percentage of submissions
+fn detect_boilerplate_grams(
+    submissions: &[Submission],
+    threshold: f64,
+) -> HashSet<[u8; 3]> {
+    if submissions.is_empty() || threshold <= 0.0 {
+        return HashSet::new();
+    }
+
+    let total_submissions = submissions.len() as f64;
+    let min_occurrences = (total_submissions * threshold).ceil() as usize;
+
+    // Count how many submissions contain each 3-gram
+    let mut gram_occurrence_count: HashMap<[u8; 3], usize> = HashMap::new();
+
+    for submission in submissions {
+        let grams = grams3(&submission.normalized);
+        for gram in grams.keys() {
+            *gram_occurrence_count.entry(*gram).or_insert(0) += 1;
+        }
+    }
+
+    // Keep only grams that appear in enough submissions
+    gram_occurrence_count
+        .into_iter()
+        .filter(|(_, count)| *count >= min_occurrences)
+        .map(|(gram, _)| gram)
+        .collect()
+}
+
+/// Extract boilerplate 3-grams from a specific boilerplate source
+fn extract_boilerplate_grams_from_source(source: &str) -> HashSet<[u8; 3]> {
+    grams3(source).into_keys().collect()
+}
+
+/// Remove boilerplate 3-grams from normalized code
+fn remove_boilerplate_grams(normalized: &str, boilerplate_grams: &HashSet<[u8; 3]>) -> String {
+    if boilerplate_grams.is_empty() {
+        return normalized.to_string();
+    }
+
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 3 {
+        return normalized.to_string();
+    }
+
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if i + 2 < bytes.len() {
+            let gram = [bytes[i], bytes[i + 1], bytes[i + 2]];
+            if boilerplate_grams.contains(&gram) {
+                // Skip this character and continue
+                i += 1;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&result).to_string()
 }
 
 fn normalize_code(source: &str, language: Language, lowercase: bool) -> String {
